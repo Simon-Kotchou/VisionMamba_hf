@@ -71,77 +71,97 @@ class MambaBlock(nn.Module):
         return hidden_states
 
 class Mamba(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: VisionMambaConfig):
         super().__init__()
         self.config = config
-        
-        self.d_model = config.embed_dim
-        self.d_state = config.d_state
-        self.d_conv = config.d_conv
-        self.expand = config.expand_factor
-        self.d_inner = int(self.expand * self.d_model)
-        
-        self.dt_rank = math.ceil(self.d_model / 16) if config.dt_rank == "auto" else config.dt_rank
-        
-        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=config.bias)
+
+        self.in_proj = nn.Linear(config.d_model, config.d_inner * 2, bias=config.bias)
+
         self.conv1d = nn.Conv1d(
-            in_channels=self.d_inner,
-            out_channels=self.d_inner,
-            kernel_size=config.kernel_size,
+            in_channels=config.d_inner,
+            out_channels=config.d_inner,
+            kernel_size=config.d_conv,
             bias=config.conv_bias,
-            groups=self.d_inner,
-            padding=config.kernel_size - 1,
+            groups=config.d_inner,
+            padding=config.d_conv - 1,
         )
-        
+
         self.act = nn.SiLU()
-        
-        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False)
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
-        
-        self.A = nn.Parameter(torch.randn(self.d_inner, self.d_state))
-        self.D = nn.Parameter(torch.randn(self.d_inner))
-        
-        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=config.bias)
-        
+
+        self.x_proj = nn.Linear(config.d_inner, config.dt_rank + config.d_state * 2, bias=False)
+        self.dt_proj = nn.Linear(config.dt_rank, config.d_inner, bias=True)
+
+        # Initialize dt_proj
+        dt_init_std = config.dt_rank**-0.5 * config.dt_scale
+        if config.dt_init == "constant":
+            nn.init.constant_(self.dt_proj.weight, dt_init_std)
+        elif config.dt_init == "random":
+            nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+        else:
+            raise NotImplementedError
+
+        # Initialize dt_proj bias
+        dt = torch.exp(
+            torch.rand(config.d_inner) * (math.log(config.dt_max) - math.log(config.dt_min))
+            + math.log(config.dt_min)
+        ).clamp(min=config.dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
+        self.dt_proj.bias._no_reinit = True
+
+        # S4D real initialization
+        A = repeat(torch.arange(1, config.d_state + 1), 'n -> d n', d=config.d_inner)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.A_log._no_weight_decay = True
+
+        self.D = nn.Parameter(torch.ones(config.d_inner))
+        self.D._no_weight_decay = True
+
+        self.out_proj = nn.Linear(config.d_inner, config.d_model, bias=config.bias)
+        self.norm = RMSNorm(config.d_model)
+
     def forward(self, x):
         B, L, _ = x.shape
-        
+        x_copy = x 
+
+        x = self.norm(x)
         x_and_res = self.in_proj(x)
-        (x, res) = x_and_res.chunk(2, dim=-1)
-        
+        x, res = x_and_res.chunk(2, dim=-1)
+
         x = rearrange(x, 'b l d -> b d l')
         x = self.conv1d(x)[:, :, :L]
         x = rearrange(x, 'b d l -> b l d')
         
         x = self.act(x)
-        
+
         x_dbl = self.x_proj(x)
-        (delta, B, C) = x_dbl.split([self.dt_rank, self.d_state, self.d_state], dim=-1)
-        
-        delta = F.softplus(self.dt_proj(delta))
-        
-        y = self.selective_scan(x, delta, A=self.A, B=B, C=C, D=self.D)
-        
+        dt, B, C = torch.split(x_dbl, [self.config.dt_rank, self.config.d_state, self.config.d_state], dim=-1)
+        dt = self.dt_proj.weight @ dt.transpose(-1, -2)
+        dt = rearrange(dt, 'd (b l) -> b l d', l=L)
+        B = rearrange(B, '(b l) dstate -> b dstate l', l=L).contiguous()
+        C = rearrange(C, '(b l) dstate -> b dstate l', l=L).contiguous()
+
+        y = self.selective_scan(x, dt, -torch.exp(self.A_log.float()), B, C, self.D.float())
+
         y = y * F.silu(res)
         
-        output = self.out_proj(y)
-        
+        output = self.out_proj(y) + x_copy
+
         return output
-    
+
     def selective_scan(self, u, delta, A, B, C, D):
-        deltaA = torch.exp(einsum(delta, A, 'b l d_in, d_in d_state -> b l d_in d_state'))
-        deltaB_u = einsum(delta, B, u, 'b l d_in, b l d_state, b l d_in -> b d_in l d_state')
+        deltaA = torch.exp(torch.einsum('blr,dn->bldrn', F.softplus(delta + self.dt_proj.bias), A))
+        deltaB_u = torch.einsum('blr,brl,blr->bldr', delta, B, u)
         
-        x = torch.zeros((u.shape[0], self.d_inner, self.d_state), device=u.device)
+        x = torch.zeros(u.shape[0], u.shape[2], A.shape[1], device=u.device, dtype=u.dtype)
         ys = []
-        for i in range(u.shape[1]):
-            x = deltaA[:, i] * x + deltaB_u[:, :, i]
-            y = einsum(x, C[:, i], 'b d_in d_state, b d_state -> b d_in')
+        for l in range(u.shape[1]):
+            x = torch.einsum('bdn,bdrn->bdr', x, deltaA[:, l]) + deltaB_u[:, l]
+            y = torch.einsum('bdr,br->bd', x, C[:, :, l])
             ys.append(y)
         y = torch.stack(ys, dim=1)
-        
-        y = y + u * D
-        
+        y = y + u * D[None, None, :]
         return y
 
 class VisionMambaModel(VisionMambaPreTrainedModel):
