@@ -1,4 +1,5 @@
 import math
+import random
 from typing import Optional, Tuple, Union
 
 import torch
@@ -196,11 +197,16 @@ class VisionMambaModel(VisionMambaPreTrainedModel):
         )
 
         if config.if_cls_token:
-            self.cls_token = nn.Parameter(torch.zeros(1, 1, config.embed_dim))
+            if config.use_middle_cls_token:
+                self.cls_token = nn.Parameter(torch.zeros(1, 1, config.embed_dim))
+            else:
+                self.cls_token_head = nn.Parameter(torch.zeros(1, 1, config.embed_dim))
+                self.cls_token_tail = nn.Parameter(torch.zeros(1, 1, config.embed_dim))
 
         if config.if_abs_pos_embed:
             num_patches = self.patch_embed.num_patches
             self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + (1 if config.if_cls_token else 0), config.embed_dim))
+            self.pos_drop = nn.Dropout(p=config.drop_rate)
 
         if config.if_rope:
             self.rope = VisionRotaryEmbeddingFast(
@@ -209,22 +215,92 @@ class VisionMambaModel(VisionMambaPreTrainedModel):
                 ft_seq_len=self.patch_embed.num_patches
             )
 
-        self.if_rope = config.if_rope
-        self.if_rope_residual = config.if_rope_residual
-        self.flip_img_sequences_ratio = config.flip_img_sequences_ratio
-
         self.blocks = nn.ModuleList([MambaBlock(config, i) for i in range(config.depth)])
 
         self.norm = RMSNorm(config.embed_dim) if config.use_final_norm else nn.Identity()
 
+        self.if_cls_token = config.if_cls_token
+        self.use_middle_cls_token = config.use_middle_cls_token
+        self.if_abs_pos_embed = config.if_abs_pos_embed
+        self.if_rope = config.if_rope
+        self.if_rope_residual = config.if_rope_residual
+        self.flip_img_sequences_ratio = config.flip_img_sequences_ratio
+        self.final_pool_type = config.final_pool_type
+
         self.post_init()
+
+    def forward_features(self, x, inference_params=None, if_random_cls_token_position=False, if_random_token_rank=False):
+        x = self.patch_embed(x)
+        B, M, _ = x.shape
+
+        if self.if_cls_token:
+            if self.use_middle_cls_token:
+                cls_token = self.cls_token.expand(B, -1, -1)
+                token_position = M // 2
+                x = torch.cat((x[:, :token_position, :], cls_token, x[:, token_position:, :]), dim=1)
+            else:
+                cls_token_head = self.cls_token_head.expand(B, -1, -1)
+                cls_token_tail = self.cls_token_tail.expand(B, -1, -1)
+                token_position = [0, M + 1]
+                x = torch.cat((cls_token_head, x, cls_token_tail), dim=1)
+            M = x.shape[1]
+
+        if self.if_abs_pos_embed:
+            x = x + self.pos_embed
+            x = self.pos_drop(x)
+
+        if if_random_token_rank:
+            shuffle_indices = torch.randperm(M)
+            x = x[:, shuffle_indices, :]
+            if isinstance(token_position, list):
+                token_position = [torch.where(shuffle_indices == pos)[0].item() for pos in token_position]
+            else:
+                token_position = torch.where(shuffle_indices == token_position)[0].item()
+
+        if_flip_img_sequences = False
+        if self.flip_img_sequences_ratio > 0 and (self.flip_img_sequences_ratio - random.random()) > 1e-5:
+            x = x.flip([1])
+            if_flip_img_sequences = True
+
+        hidden_states = x
+        for layer in self.blocks:
+            if if_flip_img_sequences and self.if_rope:
+                hidden_states = hidden_states.flip([1])
+
+            if self.if_rope:
+                hidden_states = self.rope(hidden_states)
+
+            if if_flip_img_sequences and self.if_rope:
+                hidden_states = hidden_states.flip([1])
+
+            hidden_states = layer(hidden_states, inference_params=inference_params)
+
+        hidden_states = self.norm(hidden_states)
+
+        if self.if_cls_token:
+            if self.use_middle_cls_token:
+                return hidden_states[:, token_position, :]
+            else:
+                return (hidden_states[:, token_position[0], :] + hidden_states[:, token_position[1], :]) / 2
+
+        if self.final_pool_type == 'none':
+            return hidden_states[:, -1, :]
+        elif self.final_pool_type == 'mean':
+            return hidden_states.mean(dim=1)
+        elif self.final_pool_type == 'max':
+            return hidden_states.max(dim=1)[0]
+        elif self.final_pool_type == 'all':
+            return hidden_states
+        else:
+            raise NotImplementedError
 
     def forward(
         self,
         pixel_values: Optional[torch.FloatTensor] = None,
-        inference_params=None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        if_random_cls_token_position: bool = False,
+        if_random_token_rank: bool = False,
     ) -> Union[Tuple, BaseModelOutputWithPooling]:
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -232,40 +308,19 @@ class VisionMambaModel(VisionMambaPreTrainedModel):
         if pixel_values is None:
             raise ValueError("You have to specify pixel_values")
 
-        x = self.patch_embed(pixel_values)
-
-        if self.config.if_cls_token:
-            cls_token = self.cls_token.expand(x.shape[0], -1, -1)
-            if self.config.use_middle_cls_token:
-                x = torch.cat((x[:, :x.size(1)//2], cls_token, x[:, x.size(1)//2:]), dim=1)
-            else:
-                x = torch.cat((cls_token, x), dim=1)
-
-        if self.config.if_abs_pos_embed:
-            x = x + self.pos_embed
-
-        hidden_states = []
-        for block in self.blocks:
-            x = block(x)
-            if output_hidden_states:
-                hidden_states.append(x)
-
-        x = self.norm(x)
-
-        if self.config.final_pool_type == 'mean':
-            pooled_output = x.mean(dim=1)
-        elif self.config.if_cls_token:
-            pooled_output = x[:, 0]
-        else:
-            pooled_output = x[:, -1]
+        hidden_states = self.forward_features(
+            pixel_values, 
+            if_random_cls_token_position=if_random_cls_token_position, 
+            if_random_token_rank=if_random_token_rank
+        )
 
         if not return_dict:
-            return (x, pooled_output) + (hidden_states,) if output_hidden_states else (x, pooled_output)
+            return (hidden_states,)
 
         return BaseModelOutputWithPooling(
-            last_hidden_state=x,
-            pooler_output=pooled_output,
-            hidden_states=hidden_states if output_hidden_states else None,
+            last_hidden_state=hidden_states,
+            pooler_output=hidden_states,
+            hidden_states=None,
         )
 
 class VisionMambaForImageClassification(VisionMambaPreTrainedModel):
@@ -292,7 +347,7 @@ class VisionMambaForImageClassification(VisionMambaPreTrainedModel):
             return_dict=return_dict,
         )
 
-        pooled_output = outputs.pooler_output if return_dict else outputs[1]
+        pooled_output = outputs.pooler_output if return_dict else outputs[0]
 
         logits = self.classifier(pooled_output)
 
@@ -302,7 +357,7 @@ class VisionMambaForImageClassification(VisionMambaPreTrainedModel):
             loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
 
         if not return_dict:
-            output = (logits,) + outputs[2:]
+            output = (logits,) + outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
         return ImageClassifierOutputWithNoAttention(
