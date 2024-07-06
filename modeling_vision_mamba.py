@@ -4,7 +4,7 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, repeat, einsum
+from einops import rearrange, repeat
 
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import BaseModelOutputWithPooling, ImageClassifierOutputWithNoAttention
@@ -53,7 +53,7 @@ class PatchEmbed(nn.Module):
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
         x = self.proj(x).flatten(2).transpose(1, 2)
         return x
-    
+
 class MambaBlock(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -61,38 +61,46 @@ class MambaBlock(nn.Module):
         self.layer_idx = layer_idx
 
         self.norm = RMSNorm(config.embed_dim)
-        self.mixer = Mamba(config)
+        self.mixer = Mamba(config, layer_idx=layer_idx)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, inference_params=None):
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
-        hidden_states = self.mixer(hidden_states)
+        hidden_states = self.mixer(hidden_states, inference_params=inference_params)
         hidden_states = residual + hidden_states
         return hidden_states
 
 class Mamba(nn.Module):
-    def __init__(self, config: VisionMambaConfig):
+    def __init__(self, config: VisionMambaConfig, layer_idx=None):
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx
 
-        self.in_proj = nn.Linear(config.d_model, config.d_inner * 2, bias=config.bias)
+        self.d_model = config.embed_dim
+        self.d_state = config.d_state
+        self.d_conv = config.d_conv
+        self.expand = config.expand_factor
+        self.d_inner = int(self.expand * self.d_model)
+        self.dt_rank = math.ceil(self.d_model / 16) if config.dt_rank == "auto" else config.dt_rank
+
+        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=config.bias)
 
         self.conv1d = nn.Conv1d(
-            in_channels=config.d_inner,
-            out_channels=config.d_inner,
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
             kernel_size=config.d_conv,
             bias=config.conv_bias,
-            groups=config.d_inner,
+            groups=self.d_inner,
             padding=config.d_conv - 1,
         )
 
         self.act = nn.SiLU()
 
-        self.x_proj = nn.Linear(config.d_inner, config.dt_rank + config.d_state * 2, bias=False)
-        self.dt_proj = nn.Linear(config.dt_rank, config.d_inner, bias=True)
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
 
         # Initialize dt_proj
-        dt_init_std = config.dt_rank**-0.5 * config.dt_scale
+        dt_init_std = self.dt_rank**-0.5 * config.dt_scale
         if config.dt_init == "constant":
             nn.init.constant_(self.dt_proj.weight, dt_init_std)
         elif config.dt_init == "random":
@@ -102,7 +110,7 @@ class Mamba(nn.Module):
 
         # Initialize dt_proj bias
         dt = torch.exp(
-            torch.rand(config.d_inner) * (math.log(config.dt_max) - math.log(config.dt_min))
+            torch.rand(self.d_inner) * (math.log(config.dt_max) - math.log(config.dt_min))
             + math.log(config.dt_min)
         ).clamp(min=config.dt_init_floor)
         inv_dt = dt + torch.log(-torch.expm1(-dt))
@@ -111,47 +119,40 @@ class Mamba(nn.Module):
         self.dt_proj.bias._no_reinit = True
 
         # S4D real initialization
-        A = repeat(torch.arange(1, config.d_state + 1), 'n -> d n', d=config.d_inner)
+        A = repeat(torch.arange(1, self.d_state + 1), 'n -> d n', d=self.d_inner)
         self.A_log = nn.Parameter(torch.log(A))
         self.A_log._no_weight_decay = True
 
-        self.D = nn.Parameter(torch.ones(config.d_inner))
+        self.D = nn.Parameter(torch.ones(self.d_inner))
         self.D._no_weight_decay = True
 
-        self.out_proj = nn.Linear(config.d_inner, config.d_model, bias=config.bias)
-        self.norm = RMSNorm(config.d_model)
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=config.bias)
 
-    def forward(self, x):
+    def forward(self, x, inference_params=None):
         B, L, _ = x.shape
-        x_copy = x 
 
-        x = self.norm(x)
-        x_and_res = self.in_proj(x)
-        x, res = x_and_res.chunk(2, dim=-1)
+        xz = rearrange(self.in_proj(x), "b l d -> b d l")
+        x, z = xz.chunk(2, dim=1)
 
-        x = rearrange(x, 'b l d -> b d l')
-        x = self.conv1d(x)[:, :, :L]
-        x = rearrange(x, 'b d l -> b l d')
+        x = self.act(self.conv1d(x)[..., :L])
+
+        x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
+        dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = self.dt_proj.weight @ dt.t()
+        dt = rearrange(dt, "d (b l) -> b d l", l=L)
+        B = rearrange(B, "(b l) dstate -> b dstate l", l=L).contiguous()
+        C = rearrange(C, "(b l) dstate -> b dstate l", l=L).contiguous()
+
+        A = -torch.exp(self.A_log.float())
+
+        y = self.selective_scan(x, dt, A, B, C, self.D.float(), z)
+        y = rearrange(y, "b d l -> b l d")
         
-        x = self.act(x)
+        out = self.out_proj(y)
+        return out
 
-        x_dbl = self.x_proj(x)
-        dt, B, C = torch.split(x_dbl, [self.config.dt_rank, self.config.d_state, self.config.d_state], dim=-1)
-        dt = self.dt_proj.weight @ dt.transpose(-1, -2)
-        dt = rearrange(dt, 'd (b l) -> b l d', l=L)
-        B = rearrange(B, '(b l) dstate -> b dstate l', l=L).contiguous()
-        C = rearrange(C, '(b l) dstate -> b dstate l', l=L).contiguous()
-
-        y = self.selective_scan(x, dt, -torch.exp(self.A_log.float()), B, C, self.D.float())
-
-        y = y * F.silu(res)
-        
-        output = self.out_proj(y) + x_copy
-
-        return output
-
-    def selective_scan(self, u, delta, A, B, C, D):
-        deltaA = torch.exp(torch.einsum('blr,dn->bldrn', F.softplus(delta + self.dt_proj.bias), A))
+    def selective_scan(self, u, delta, A, B, C, D, z):
+        deltaA = torch.exp(torch.einsum('blr,dn->bldrn', F.softplus(delta), A))
         deltaB_u = torch.einsum('blr,brl,blr->bldr', delta, B, u)
         
         x = torch.zeros(u.shape[0], u.shape[2], A.shape[1], device=u.device, dtype=u.dtype)
@@ -162,7 +163,7 @@ class Mamba(nn.Module):
             ys.append(y)
         y = torch.stack(ys, dim=1)
         y = y + u * D[None, None, :]
-        return y
+        return y * self.act(z)
 
 class VisionMambaModel(VisionMambaPreTrainedModel):
     def __init__(self, config):
