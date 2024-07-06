@@ -8,6 +8,24 @@ from einops import rearrange, repeat, einsum
 
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import BaseModelOutputWithPooling, ImageClassifierOutputWithNoAttention
+from configuration_vision_mamba import VisionMambaConfig
+
+class VisionMambaPreTrainedModel(PreTrainedModel):
+    config_class = VisionMambaConfig
+    base_model_prefix = "vision_mamba"
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Conv2d):
+            nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
 
 class RMSNorm(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-5):
@@ -125,3 +143,120 @@ class Mamba(nn.Module):
         y = y + u * D
         
         return y
+
+class VisionMambaModel(VisionMambaPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.config = config
+
+        self.patch_embed = PatchEmbed(
+            img_size=config.img_size,
+            patch_size=config.patch_size,
+            stride=config.stride,
+            in_chans=config.in_chans,
+            embed_dim=config.embed_dim
+        )
+
+        if config.if_cls_token:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, config.embed_dim))
+
+        if config.if_abs_pos_embed:
+            num_patches = self.patch_embed.num_patches
+            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + (1 if config.if_cls_token else 0), config.embed_dim))
+
+        self.blocks = nn.ModuleList([MambaBlock(config, i) for i in range(config.depth)])
+
+        self.norm = RMSNorm(config.embed_dim) if config.use_final_norm else nn.Identity()
+
+        self.post_init()
+
+    def forward(
+        self,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, BaseModelOutputWithPooling]:
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if pixel_values is None:
+            raise ValueError("You have to specify pixel_values")
+
+        x = self.patch_embed(pixel_values)
+
+        if self.config.if_cls_token:
+            cls_token = self.cls_token.expand(x.shape[0], -1, -1)
+            if self.config.use_middle_cls_token:
+                x = torch.cat((x[:, :x.size(1)//2], cls_token, x[:, x.size(1)//2:]), dim=1)
+            else:
+                x = torch.cat((cls_token, x), dim=1)
+
+        if self.config.if_abs_pos_embed:
+            x = x + self.pos_embed
+
+        hidden_states = []
+        for block in self.blocks:
+            x = block(x)
+            if output_hidden_states:
+                hidden_states.append(x)
+
+        x = self.norm(x)
+
+        if self.config.final_pool_type == 'mean':
+            pooled_output = x.mean(dim=1)
+        elif self.config.if_cls_token:
+            pooled_output = x[:, 0]
+        else:
+            pooled_output = x[:, -1]
+
+        if not return_dict:
+            return (x, pooled_output) + (hidden_states,) if output_hidden_states else (x, pooled_output)
+
+        return BaseModelOutputWithPooling(
+            last_hidden_state=x,
+            pooler_output=pooled_output,
+            hidden_states=hidden_states if output_hidden_states else None,
+        )
+
+class VisionMambaForImageClassification(VisionMambaPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_classes
+        self.vision_mamba = VisionMambaModel(config)
+        self.classifier = nn.Linear(config.embed_dim, config.num_classes) if config.num_classes > 0 else nn.Identity()
+
+        self.post_init()
+
+    def forward(
+        self,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, ImageClassifierOutputWithNoAttention]:
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.vision_mamba(
+            pixel_values,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        pooled_output = outputs.pooler_output if return_dict else outputs[1]
+
+        logits = self.classifier(pooled_output)
+
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+
+        if not return_dict:
+            output = (logits,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
+
+        return ImageClassifierOutputWithNoAttention(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+        )
