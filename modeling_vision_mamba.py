@@ -8,7 +8,9 @@ from einops import rearrange, repeat
 
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import BaseModelOutputWithPooling, ImageClassifierOutputWithNoAttention
+
 from configuration_vision_mamba import VisionMambaConfig
+from rope import VisionRotaryEmbeddingFast
 
 class VisionMambaPreTrainedModel(PreTrainedModel):
     config_class = VisionMambaConfig
@@ -53,6 +55,21 @@ class PatchEmbed(nn.Module):
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
         x = self.proj(x).flatten(2).transpose(1, 2)
         return x
+    
+class DropPath(nn.Module):
+    def __init__(self, drop_prob: float = 0.):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if self.drop_prob == 0. or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()  # binarize
+        output = x.div(keep_prob) * random_tensor
+        return output
 
 class MambaBlock(nn.Module):
     def __init__(self, config, layer_idx):
@@ -185,6 +202,17 @@ class VisionMambaModel(VisionMambaPreTrainedModel):
             num_patches = self.patch_embed.num_patches
             self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + (1 if config.if_cls_token else 0), config.embed_dim))
 
+        if config.if_rope:
+            self.rope = VisionRotaryEmbeddingFast(
+                dim=config.embed_dim // 2,
+                pt_seq_len=config.pt_hw_seq_len,
+                ft_seq_len=self.patch_embed.num_patches
+            )
+
+        self.if_rope = config.if_rope
+        self.if_rope_residual = config.if_rope_residual
+        self.flip_img_sequences_ratio = config.flip_img_sequences_ratio
+
         self.blocks = nn.ModuleList([MambaBlock(config, i) for i in range(config.depth)])
 
         self.norm = RMSNorm(config.embed_dim) if config.use_final_norm else nn.Identity()
@@ -194,6 +222,7 @@ class VisionMambaModel(VisionMambaPreTrainedModel):
     def forward(
         self,
         pixel_values: Optional[torch.FloatTensor] = None,
+        inference_params=None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPooling]:
