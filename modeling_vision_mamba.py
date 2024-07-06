@@ -224,6 +224,7 @@ class VisionMambaModel(VisionMambaPreTrainedModel):
         self.if_abs_pos_embed = config.if_abs_pos_embed
         self.if_rope = config.if_rope
         self.if_rope_residual = config.if_rope_residual
+        self.if_bidirectional = config.bimamba_type != "none"
         self.flip_img_sequences_ratio = config.flip_img_sequences_ratio
         self.final_pool_type = config.final_pool_type
 
@@ -262,18 +263,33 @@ class VisionMambaModel(VisionMambaPreTrainedModel):
             x = x.flip([1])
             if_flip_img_sequences = True
 
-        hidden_states = x
-        for layer in self.blocks:
-            if if_flip_img_sequences and self.if_rope:
-                hidden_states = hidden_states.flip([1])
+        if not self.if_bidirectional:
+            for layer in self.blocks:
+                if if_flip_img_sequences and self.if_rope:
+                    hidden_states = hidden_states.flip([1])
 
-            if self.if_rope:
-                hidden_states = self.rope(hidden_states)
+                if self.if_rope:
+                    hidden_states = self.rope(hidden_states)
 
-            if if_flip_img_sequences and self.if_rope:
-                hidden_states = hidden_states.flip([1])
+                if if_flip_img_sequences and self.if_rope:
+                    hidden_states = hidden_states.flip([1])
 
-            hidden_states = layer(hidden_states, inference_params=inference_params)
+                hidden_states = layer(hidden_states, inference_params=inference_params)
+        else:
+            # Bidirectional processing
+            for i in range(0, len(self.blocks), 2):
+                if self.if_rope:
+                    hidden_states = self.rope(hidden_states)
+
+                # Forward direction
+                hidden_states_f = self.blocks[i](hidden_states, inference_params=inference_params)
+                
+                # Backward direction
+                hidden_states_b = self.blocks[i+1](hidden_states.flip([1]), inference_params=inference_params)
+                hidden_states_b = hidden_states_b.flip([1])
+
+                # Combine forward and backward
+                hidden_states = hidden_states_f + hidden_states_b
 
         hidden_states = self.norm(hidden_states)
 
