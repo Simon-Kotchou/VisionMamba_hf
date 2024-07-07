@@ -36,6 +36,9 @@ class VisionMambaConfig(PretrainedConfig):
         if_use_residual=True,
         residual_in_fp32=False,
         fused_add_norm=False,
+        use_fast_path=True,
+        if_devide_out=False,
+        init_layer_scale=None,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -72,3 +75,6 @@ class VisionMambaConfig(PretrainedConfig):
         self.if_use_residual = if_use_residual
         self.residual_in_fp32 = residual_in_fp32
         self.fused_add_norm = fused_add_norm
+        self.use_fast_path = use_fast_path
+        self.if_devide_out = if_devide_out
+        self.init_layer_scale = init_layer_scale
