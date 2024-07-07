@@ -21,25 +21,25 @@ def rename_key(name):
     else:
         return name
 
-def combine_bidirectional_params(state_dict):
-    new_state_dict = {}
-    for key, value in state_dict.items():
-        if "mixer" in key:
-            # Remove the '_b' suffix for backward direction parameters
-            new_key = key.replace("mixer.A_b_log", "mixer.A_log")
-            new_key = new_key.replace("mixer.D_b", "mixer.D")
-            new_key = new_key.replace("mixer.conv1d_b", "mixer.conv1d")
-            new_key = new_key.replace("mixer.x_proj_b", "mixer.x_proj")
-            new_key = new_key.replace("mixer.dt_proj_b", "mixer.dt_proj")
+# def combine_bidirectional_params(state_dict):
+#     new_state_dict = {}
+#     for key, value in state_dict.items():
+#         if "mixer" in key:
+#             # Remove the '_b' suffix for backward direction parameters
+#             new_key = key.replace("mixer.A_b_log", "mixer.A_log")
+#             new_key = new_key.replace("mixer.D_b", "mixer.D")
+#             new_key = new_key.replace("mixer.conv1d_b", "mixer.conv1d")
+#             new_key = new_key.replace("mixer.x_proj_b", "mixer.x_proj")
+#             new_key = new_key.replace("mixer.dt_proj_b", "mixer.dt_proj")
             
-            if new_key in new_state_dict:
-                # Combine forward and backward parameters
-                new_state_dict[new_key] = torch.cat([new_state_dict[new_key], value], dim=0)
-            else:
-                new_state_dict[new_key] = value
-        else:
-            new_state_dict[key] = value
-    return new_state_dict
+#             if new_key in new_state_dict:
+#                 # Combine forward and backward parameters
+#                 new_state_dict[new_key] = torch.cat([new_state_dict[new_key], value], dim=0)
+#             else:
+#                 new_state_dict[new_key] = value
+#         else:
+#             new_state_dict[key] = value
+#     return new_state_dict
 
 def convert_vim_checkpoint(checkpoint_path, pytorch_dump_folder_path, config_path=None, push_to_hub=False):
     # Load the original state dict
@@ -47,14 +47,13 @@ def convert_vim_checkpoint(checkpoint_path, pytorch_dump_folder_path, config_pat
     if "model" in state_dict:
         state_dict = state_dict["model"]
 
-    # Combine bidirectional parameters
-    state_dict = combine_bidirectional_params(state_dict)
+    # # Combine bidirectional parameters
+    # state_dict = combine_bidirectional_params(state_dict)
 
     # Load or create config
     if config_path:
         config = PretrainedConfig.from_json_file(config_path)
     else:
-        # You might need to adjust these values based on the specific model
         config = VisionMambaConfig(
             img_size=224,
             patch_size=16,
