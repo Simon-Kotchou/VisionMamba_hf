@@ -1,4 +1,5 @@
 import math
+import random
 from typing import Optional, Tuple, Union
 
 import torch
@@ -8,7 +9,9 @@ from einops import rearrange, repeat
 
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import BaseModelOutputWithPooling, ImageClassifierOutputWithNoAttention
+
 from configuration_vision_mamba import VisionMambaConfig
+from rope import VisionRotaryEmbeddingFast
 
 class VisionMambaPreTrainedModel(PreTrainedModel):
     config_class = VisionMambaConfig
@@ -53,6 +56,21 @@ class PatchEmbed(nn.Module):
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
         x = self.proj(x).flatten(2).transpose(1, 2)
         return x
+    
+class DropPath(nn.Module):
+    def __init__(self, drop_prob: float = 0.):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if self.drop_prob == 0. or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()  # binarize
+        output = x.div(keep_prob) * random_tensor
+        return output
 
 class MambaBlock(nn.Module):
     def __init__(self, config, layer_idx):
@@ -126,29 +144,102 @@ class Mamba(nn.Module):
         self.D = nn.Parameter(torch.ones(self.d_inner))
         self.D._no_weight_decay = True
 
+        # Bidirectional processing
+        if config.bimamba_type == "v1":
+            A_b = repeat(torch.arange(1, self.d_state + 1), 'n -> d n', d=self.d_inner)
+            self.A_b_log = nn.Parameter(torch.log(A_b))
+            self.A_b_log._no_weight_decay = True
+        elif config.bimamba_type == "v2":
+            A_b = repeat(torch.arange(1, self.d_state + 1), 'n -> d n', d=self.d_inner)
+            self.A_b_log = nn.Parameter(torch.log(A_b))
+            self.A_b_log._no_weight_decay = True
+
+            self.conv1d_b = nn.Conv1d(
+                in_channels=self.d_inner,
+                out_channels=self.d_inner,
+                kernel_size=config.d_conv,
+                bias=config.conv_bias,
+                groups=self.d_inner,
+                padding=config.d_conv - 1,
+            )
+
+            self.x_proj_b = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False)
+            self.dt_proj_b = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+
+            self.D_b = nn.Parameter(torch.ones(self.d_inner))
+            self.D_b._no_weight_decay = True
+
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=config.bias)
 
-    def forward(self, x, inference_params=None):
-        B, L, _ = x.shape
+        if config.init_layer_scale is not None:
+            self.gamma = nn.Parameter(config.init_layer_scale * torch.ones((self.d_model)))
 
-        xz = rearrange(self.in_proj(x), "b l d -> b d l")
+    def forward(self, hidden_states, inference_params=None):
+        B, L, _ = hidden_states.shape
+
+        xz = rearrange(self.in_proj(hidden_states), "b l d -> b d l")
         x, z = xz.chunk(2, dim=1)
 
-        x = self.act(self.conv1d(x)[..., :L])
+        if self.config.bimamba_type == "none":
+            x = self.act(self.conv1d(x)[..., :L])
+            x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
+            dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+            dt = self.dt_proj.weight @ dt.t()
+            dt = rearrange(dt, "d (b l) -> b d l", l=L)
+            B = rearrange(B, "(b l) dstate -> b dstate l", l=L).contiguous()
+            C = rearrange(C, "(b l) dstate -> b dstate l", l=L).contiguous()
 
-        x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
-        dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        dt = self.dt_proj.weight @ dt.t()
-        dt = rearrange(dt, "d (b l) -> b d l", l=L)
-        B = rearrange(B, "(b l) dstate -> b dstate l", l=L).contiguous()
-        C = rearrange(C, "(b l) dstate -> b dstate l", l=L).contiguous()
+            A = -torch.exp(self.A_log.float())
 
-        A = -torch.exp(self.A_log.float())
+            y = self.selective_scan(x, dt, A, B, C, self.D.float(), z)
+            y = rearrange(y, "b d l -> b l d")
+            out = self.out_proj(y)
 
-        y = self.selective_scan(x, dt, A, B, C, self.D.float(), z)
-        y = rearrange(y, "b d l -> b l d")
-        
-        out = self.out_proj(y)
+        elif self.config.bimamba_type in ["v1", "v2"]:
+            A = -torch.exp(self.A_log.float())
+            A_b = -torch.exp(self.A_b_log.float())
+
+            if self.config.bimamba_type == "v1":
+                x = self.act(self.conv1d(x)[..., :L])
+                x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
+                dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+                dt = self.dt_proj.weight @ dt.t()
+                dt = rearrange(dt, "d (b l) -> b d l", l=L)
+                B = rearrange(B, "(b l) dstate -> b dstate l", l=L).contiguous()
+                C = rearrange(C, "(b l) dstate -> b dstate l", l=L).contiguous()
+
+                y_f = self.selective_scan(x, dt, A, B, C, self.D.float(), z)
+                y_b = self.selective_scan(x.flip([-1]), dt.flip([-1]), A_b, B.flip([-1]), C.flip([-1]), self.D.float(), z.flip([-1]))
+                y = y_f + y_b.flip([-1])
+
+            elif self.config.bimamba_type == "v2":
+                x_f = self.act(self.conv1d(x)[..., :L])
+                x_b = self.act(self.conv1d_b(x.flip([-1]))[..., :L])
+
+                x_dbl_f = self.x_proj(rearrange(x_f, "b d l -> (b l) d"))
+                dt_f, B_f, C_f = torch.split(x_dbl_f, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+                dt_f = self.dt_proj.weight @ dt_f.t()
+                dt_f = rearrange(dt_f, "d (b l) -> b d l", l=L)
+                B_f = rearrange(B_f, "(b l) dstate -> b dstate l", l=L).contiguous()
+                C_f = rearrange(C_f, "(b l) dstate -> b dstate l", l=L).contiguous()
+
+                x_dbl_b = self.x_proj_b(rearrange(x_b, "b d l -> (b l) d"))
+                dt_b, B_b, C_b = torch.split(x_dbl_b, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+                dt_b = self.dt_proj_b.weight @ dt_b.t()
+                dt_b = rearrange(dt_b, "d (b l) -> b d l", l=L)
+                B_b = rearrange(B_b, "(b l) dstate -> b dstate l", l=L).contiguous()
+                C_b = rearrange(C_b, "(b l) dstate -> b dstate l", l=L).contiguous()
+
+                y_f = self.selective_scan(x_f, dt_f, A, B_f, C_f, self.D.float(), z)
+                y_b = self.selective_scan(x_b, dt_b, A_b, B_b, C_b, self.D_b.float(), z.flip([-1]))
+                y = y_f + y_b.flip([-1])
+
+            y = rearrange(y, "b d l -> b l d")
+            out = self.out_proj(y)
+
+        if self.config.init_layer_scale is not None:
+            out = out * self.gamma
+
         return out
 
     def selective_scan(self, u, delta, A, B, C, D, z):
@@ -179,23 +270,111 @@ class VisionMambaModel(VisionMambaPreTrainedModel):
         )
 
         if config.if_cls_token:
-            self.cls_token = nn.Parameter(torch.zeros(1, 1, config.embed_dim))
+            if config.use_middle_cls_token:
+                self.cls_token = nn.Parameter(torch.zeros(1, 1, config.embed_dim))
+            else:
+                self.cls_token_head = nn.Parameter(torch.zeros(1, 1, config.embed_dim))
+                self.cls_token_tail = nn.Parameter(torch.zeros(1, 1, config.embed_dim))
 
         if config.if_abs_pos_embed:
             num_patches = self.patch_embed.num_patches
             self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + (1 if config.if_cls_token else 0), config.embed_dim))
+            self.pos_drop = nn.Dropout(p=config.drop_rate)
+
+        if config.if_rope:
+            self.rope = VisionRotaryEmbeddingFast(
+                dim=config.embed_dim // 2,
+                pt_seq_len=config.pt_hw_seq_len,
+                ft_seq_len=self.patch_embed.num_patches
+            )
 
         self.blocks = nn.ModuleList([MambaBlock(config, i) for i in range(config.depth)])
 
         self.norm = RMSNorm(config.embed_dim) if config.use_final_norm else nn.Identity()
 
+        self.if_cls_token = config.if_cls_token
+        self.use_middle_cls_token = config.use_middle_cls_token
+        self.if_abs_pos_embed = config.if_abs_pos_embed
+        self.if_rope = config.if_rope
+        self.if_rope_residual = config.if_rope_residual
+        self.bimamba_type = config.bimamba_type
+        self.flip_img_sequences_ratio = config.flip_img_sequences_ratio
+        self.final_pool_type = config.final_pool_type
+
         self.post_init()
+
+    def forward_features(self, x, inference_params=None, if_random_cls_token_position=False, if_random_token_rank=False):
+        x = self.patch_embed(x)
+        B, M, _ = x.shape
+
+        if self.if_cls_token:
+            if self.use_middle_cls_token:
+                cls_token = self.cls_token.expand(B, -1, -1)
+                token_position = M // 2
+                x = torch.cat((x[:, :token_position, :], cls_token, x[:, token_position:, :]), dim=1)
+            else:
+                cls_token_head = self.cls_token_head.expand(B, -1, -1)
+                cls_token_tail = self.cls_token_tail.expand(B, -1, -1)
+                token_position = [0, M + 1]
+                x = torch.cat((cls_token_head, x, cls_token_tail), dim=1)
+            M = x.shape[1]
+
+        if self.if_abs_pos_embed:
+            x = x + self.pos_embed
+            x = self.pos_drop(x)
+
+        if if_random_token_rank:
+            shuffle_indices = torch.randperm(M)
+            x = x[:, shuffle_indices, :]
+            if isinstance(token_position, list):
+                token_position = [torch.where(shuffle_indices == pos)[0].item() for pos in token_position]
+            else:
+                token_position = torch.where(shuffle_indices == token_position)[0].item()
+
+        if_flip_img_sequences = False
+        if self.flip_img_sequences_ratio > 0 and (self.flip_img_sequences_ratio - random.random()) > 1e-5:
+            x = x.flip([1])
+            if_flip_img_sequences = True
+
+        hidden_states = x
+        for layer in self.blocks:
+            if if_flip_img_sequences and self.if_rope:
+                hidden_states = hidden_states.flip([1])
+
+            if self.if_rope:
+                hidden_states = self.rope(hidden_states)
+
+            if if_flip_img_sequences and self.if_rope:
+                hidden_states = hidden_states.flip([1])
+
+            hidden_states = layer(hidden_states, inference_params=inference_params)
+
+        hidden_states = self.norm(hidden_states)
+
+        if self.if_cls_token:
+            if self.use_middle_cls_token:
+                return hidden_states[:, token_position, :]
+            else:
+                return (hidden_states[:, token_position[0], :] + hidden_states[:, token_position[1], :]) / 2
+
+        if self.final_pool_type == 'none':
+            return hidden_states[:, -1, :]
+        elif self.final_pool_type == 'mean':
+            return hidden_states.mean(dim=1)
+        elif self.final_pool_type == 'max':
+            return hidden_states.max(dim=1)[0]
+        elif self.final_pool_type == 'all':
+            return hidden_states
+        else:
+            raise NotImplementedError
 
     def forward(
         self,
         pixel_values: Optional[torch.FloatTensor] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        if_random_cls_token_position: bool = False,
+        if_random_token_rank: bool = False,
     ) -> Union[Tuple, BaseModelOutputWithPooling]:
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -203,40 +382,19 @@ class VisionMambaModel(VisionMambaPreTrainedModel):
         if pixel_values is None:
             raise ValueError("You have to specify pixel_values")
 
-        x = self.patch_embed(pixel_values)
-
-        if self.config.if_cls_token:
-            cls_token = self.cls_token.expand(x.shape[0], -1, -1)
-            if self.config.use_middle_cls_token:
-                x = torch.cat((x[:, :x.size(1)//2], cls_token, x[:, x.size(1)//2:]), dim=1)
-            else:
-                x = torch.cat((cls_token, x), dim=1)
-
-        if self.config.if_abs_pos_embed:
-            x = x + self.pos_embed
-
-        hidden_states = []
-        for block in self.blocks:
-            x = block(x)
-            if output_hidden_states:
-                hidden_states.append(x)
-
-        x = self.norm(x)
-
-        if self.config.final_pool_type == 'mean':
-            pooled_output = x.mean(dim=1)
-        elif self.config.if_cls_token:
-            pooled_output = x[:, 0]
-        else:
-            pooled_output = x[:, -1]
+        hidden_states = self.forward_features(
+            pixel_values, 
+            if_random_cls_token_position=if_random_cls_token_position, 
+            if_random_token_rank=if_random_token_rank
+        )
 
         if not return_dict:
-            return (x, pooled_output) + (hidden_states,) if output_hidden_states else (x, pooled_output)
+            return (hidden_states,)
 
         return BaseModelOutputWithPooling(
-            last_hidden_state=x,
-            pooler_output=pooled_output,
-            hidden_states=hidden_states if output_hidden_states else None,
+            last_hidden_state=hidden_states,
+            pooler_output=hidden_states,
+            hidden_states=None,
         )
 
 class VisionMambaForImageClassification(VisionMambaPreTrainedModel):
@@ -263,7 +421,7 @@ class VisionMambaForImageClassification(VisionMambaPreTrainedModel):
             return_dict=return_dict,
         )
 
-        pooled_output = outputs.pooler_output if return_dict else outputs[1]
+        pooled_output = outputs.pooler_output if return_dict else outputs[0]
 
         logits = self.classifier(pooled_output)
 
@@ -273,7 +431,7 @@ class VisionMambaForImageClassification(VisionMambaPreTrainedModel):
             loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
 
         if not return_dict:
-            output = (logits,) + outputs[2:]
+            output = (logits,) + outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
         return ImageClassifierOutputWithNoAttention(
