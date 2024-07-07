@@ -144,29 +144,102 @@ class Mamba(nn.Module):
         self.D = nn.Parameter(torch.ones(self.d_inner))
         self.D._no_weight_decay = True
 
+        # Bidirectional processing
+        if config.bimamba_type == "v1":
+            A_b = repeat(torch.arange(1, self.d_state + 1), 'n -> d n', d=self.d_inner)
+            self.A_b_log = nn.Parameter(torch.log(A_b))
+            self.A_b_log._no_weight_decay = True
+        elif config.bimamba_type == "v2":
+            A_b = repeat(torch.arange(1, self.d_state + 1), 'n -> d n', d=self.d_inner)
+            self.A_b_log = nn.Parameter(torch.log(A_b))
+            self.A_b_log._no_weight_decay = True
+
+            self.conv1d_b = nn.Conv1d(
+                in_channels=self.d_inner,
+                out_channels=self.d_inner,
+                kernel_size=config.d_conv,
+                bias=config.conv_bias,
+                groups=self.d_inner,
+                padding=config.d_conv - 1,
+            )
+
+            self.x_proj_b = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False)
+            self.dt_proj_b = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+
+            self.D_b = nn.Parameter(torch.ones(self.d_inner))
+            self.D_b._no_weight_decay = True
+
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=config.bias)
 
-    def forward(self, x, inference_params=None):
-        B, L, _ = x.shape
+        if config.init_layer_scale is not None:
+            self.gamma = nn.Parameter(config.init_layer_scale * torch.ones((self.d_model)))
 
-        xz = rearrange(self.in_proj(x), "b l d -> b d l")
+    def forward(self, hidden_states, inference_params=None):
+        B, L, _ = hidden_states.shape
+
+        xz = rearrange(self.in_proj(hidden_states), "b l d -> b d l")
         x, z = xz.chunk(2, dim=1)
 
-        x = self.act(self.conv1d(x)[..., :L])
+        if self.config.bimamba_type == "none":
+            x = self.act(self.conv1d(x)[..., :L])
+            x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
+            dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+            dt = self.dt_proj.weight @ dt.t()
+            dt = rearrange(dt, "d (b l) -> b d l", l=L)
+            B = rearrange(B, "(b l) dstate -> b dstate l", l=L).contiguous()
+            C = rearrange(C, "(b l) dstate -> b dstate l", l=L).contiguous()
 
-        x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
-        dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        dt = self.dt_proj.weight @ dt.t()
-        dt = rearrange(dt, "d (b l) -> b d l", l=L)
-        B = rearrange(B, "(b l) dstate -> b dstate l", l=L).contiguous()
-        C = rearrange(C, "(b l) dstate -> b dstate l", l=L).contiguous()
+            A = -torch.exp(self.A_log.float())
 
-        A = -torch.exp(self.A_log.float())
+            y = self.selective_scan(x, dt, A, B, C, self.D.float(), z)
+            y = rearrange(y, "b d l -> b l d")
+            out = self.out_proj(y)
 
-        y = self.selective_scan(x, dt, A, B, C, self.D.float(), z)
-        y = rearrange(y, "b d l -> b l d")
-        
-        out = self.out_proj(y)
+        elif self.config.bimamba_type in ["v1", "v2"]:
+            A = -torch.exp(self.A_log.float())
+            A_b = -torch.exp(self.A_b_log.float())
+
+            if self.config.bimamba_type == "v1":
+                x = self.act(self.conv1d(x)[..., :L])
+                x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
+                dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+                dt = self.dt_proj.weight @ dt.t()
+                dt = rearrange(dt, "d (b l) -> b d l", l=L)
+                B = rearrange(B, "(b l) dstate -> b dstate l", l=L).contiguous()
+                C = rearrange(C, "(b l) dstate -> b dstate l", l=L).contiguous()
+
+                y_f = self.selective_scan(x, dt, A, B, C, self.D.float(), z)
+                y_b = self.selective_scan(x.flip([-1]), dt.flip([-1]), A_b, B.flip([-1]), C.flip([-1]), self.D.float(), z.flip([-1]))
+                y = y_f + y_b.flip([-1])
+
+            elif self.config.bimamba_type == "v2":
+                x_f = self.act(self.conv1d(x)[..., :L])
+                x_b = self.act(self.conv1d_b(x.flip([-1]))[..., :L])
+
+                x_dbl_f = self.x_proj(rearrange(x_f, "b d l -> (b l) d"))
+                dt_f, B_f, C_f = torch.split(x_dbl_f, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+                dt_f = self.dt_proj.weight @ dt_f.t()
+                dt_f = rearrange(dt_f, "d (b l) -> b d l", l=L)
+                B_f = rearrange(B_f, "(b l) dstate -> b dstate l", l=L).contiguous()
+                C_f = rearrange(C_f, "(b l) dstate -> b dstate l", l=L).contiguous()
+
+                x_dbl_b = self.x_proj_b(rearrange(x_b, "b d l -> (b l) d"))
+                dt_b, B_b, C_b = torch.split(x_dbl_b, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+                dt_b = self.dt_proj_b.weight @ dt_b.t()
+                dt_b = rearrange(dt_b, "d (b l) -> b d l", l=L)
+                B_b = rearrange(B_b, "(b l) dstate -> b dstate l", l=L).contiguous()
+                C_b = rearrange(C_b, "(b l) dstate -> b dstate l", l=L).contiguous()
+
+                y_f = self.selective_scan(x_f, dt_f, A, B_f, C_f, self.D.float(), z)
+                y_b = self.selective_scan(x_b, dt_b, A_b, B_b, C_b, self.D_b.float(), z.flip([-1]))
+                y = y_f + y_b.flip([-1])
+
+            y = rearrange(y, "b d l -> b l d")
+            out = self.out_proj(y)
+
+        if self.config.init_layer_scale is not None:
+            out = out * self.gamma
+
         return out
 
     def selective_scan(self, u, delta, A, B, C, D, z):
